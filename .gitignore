@@ -1,0 +1,32 @@
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Temporary files
+.tmp/
+**/.tmp/
+pip-build-tracker-*
+pip-ephem-wheel-cache-*
+pip-install-*
+backend/tmpz5r5ay_7
+
+# Frontend
+node_modules/
+dist/
+
+# IDE
+.vscode/
+.idea/
