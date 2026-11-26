@@ -56,7 +56,7 @@ In another backend terminal, run:
 python main.py --create-admin --email admin@school.edu --name "School Admin" --password "use-a-unique-password-of-12-or-more-characters"
 ```
 
-Sign in at `http://localhost:5173/admin/login`. Admins can add, edit, and remove trainer and student accounts, enroll students in batches, and assign trainers to batches. Removing a trainer also removes their classrooms and classroom materials.
+Sign in at `http://localhost:5173/admin/login`. Admins can add, edit, and remove trainer and student accounts; enroll students; and create, edit, assign, or delete classrooms. Classrooms are independent records: removing a trainer leaves their classrooms, enrolled students, documents, and saved boards intact and marks the classroom as unassigned until an admin assigns a new trainer. Deleting a classroom is a separate, explicit action.
 
 The student may sign in to view the sample classroom. New self-registered accounts have the student role. A teacher creates student accounts from the classroom roster.
 
