@@ -53,8 +53,9 @@ class Classroom(Base):
     name: Mapped[str] = mapped_column(String(160))
     subject: Mapped[str] = mapped_column(String(100), default="General")
     description: Mapped[str] = mapped_column(Text, default="")
-    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
-    owner: Mapped[User] = relationship()
+    # Trainer is a replaceable assignment, not the classroom's owner/lifecycle.
+    owner_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    owner: Mapped[User | None] = relationship()
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     enrollments: Mapped[list["Enrollment"]] = relationship(back_populates="classroom", cascade="all, delete-orphan")
     documents: Mapped[list["Document"]] = relationship(back_populates="classroom", cascade="all, delete-orphan")
@@ -120,6 +121,14 @@ class ManagedUserInput(BaseModel):
     batch_ids: list[int] = Field(default_factory=list)
 
 
+class ManagedClassroomInput(BaseModel):
+    name: str = Field(min_length=2, max_length=160)
+    subject: str = Field(default="General", max_length=100)
+    description: str = Field(default="", max_length=2000)
+    class_id: str | None = Field(default=None, min_length=2, max_length=32)
+    trainer_id: int | None = None
+
+
 def db_session():
     db = SessionLocal()
     try: yield db
@@ -155,6 +164,7 @@ def pack_class(c: Classroom, db: Session) -> dict:
 def owned_class(db: Session, c_id: int, user: User) -> Classroom:
     c = db.get(Classroom, c_id)
     if not c: raise HTTPException(404, "Classroom not found")
+    if user.role == "admin": return c
     if user.role == "teacher" and c.owner_id == user.id: return c
     if db.scalar(select(Enrollment).where(Enrollment.classroom_id == c_id, Enrollment.student_id == user.id)): return c
     raise HTTPException(403, "You are not enrolled in this classroom")
@@ -180,6 +190,20 @@ def create_admin_account(email: str, name: str, password: str):
 @app.on_event("startup")
 def startup():
     Base.metadata.create_all(engine)
+    # SQLite cannot alter a NOT NULL constraint in place. Rebuild the classroom
+    # table so existing local installations can keep their data and drop trainers.
+    if engine.dialect.name == "sqlite":
+        with engine.begin() as conn:
+            cols = conn.exec_driver_sql("PRAGMA table_info(classrooms)").fetchall()
+            owner_col = next((col for col in cols if col[1] == "owner_id"), None)
+            if owner_col and owner_col[3]:
+                conn.exec_driver_sql("PRAGMA foreign_keys=OFF")
+                conn.exec_driver_sql("ALTER TABLE classrooms RENAME TO classrooms_old")
+                conn.exec_driver_sql("CREATE TABLE classrooms (id INTEGER NOT NULL PRIMARY KEY, class_id VARCHAR(32) NOT NULL, name VARCHAR(160) NOT NULL, subject VARCHAR(100) NOT NULL, description TEXT NOT NULL, owner_id INTEGER, created_at DATETIME NOT NULL, FOREIGN KEY(owner_id) REFERENCES users (id) ON DELETE SET NULL)")
+                conn.exec_driver_sql("INSERT INTO classrooms (id,class_id,name,subject,description,owner_id,created_at) SELECT id,class_id,name,subject,description,owner_id,created_at FROM classrooms_old")
+                conn.exec_driver_sql("DROP TABLE classrooms_old")
+                conn.exec_driver_sql("CREATE UNIQUE INDEX IF NOT EXISTS ix_classrooms_class_id ON classrooms (class_id)")
+                conn.exec_driver_sql("PRAGMA foreign_keys=ON")
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     with SessionLocal() as db:
         if not db.scalar(select(User).where(User.email == "teacher@demo.edu")):
@@ -238,7 +262,7 @@ def admin_login(data: Credentials, db: Session = Depends(db_session)):
 def admin_overview(db: Session = Depends(db_session), user: User = Depends(admin)):
     people = db.scalars(select(User).where(User.role.in_(["teacher", "student"])).order_by(User.name)).all()
     classes = db.scalars(select(Classroom).order_by(Classroom.name)).all()
-    return {"users": [{**pack_user(person), "batch_ids": [e.classroom_id for e in db.scalars(select(Enrollment).where(Enrollment.student_id == person.id)).all()], "trainer_batches": [c.id for c in classes if c.owner_id == person.id]} for person in people], "batches": [{"id": c.id, "name": c.name, "class_id": c.class_id, "subject": c.subject, "trainer_id": c.owner_id, "student_count": len(c.enrollments)} for c in classes]}
+    return {"users": [{**pack_user(person), "batch_ids": [e.classroom_id for e in db.scalars(select(Enrollment).where(Enrollment.student_id == person.id)).all()], "trainer_batches": [c.id for c in classes if c.owner_id == person.id]} for person in people], "batches": [{"id": c.id, "name": c.name, "class_id": c.class_id, "subject": c.subject, "description": c.description, "trainer_id": c.owner_id, "student_count": len(c.enrollments)} for c in classes]}
 
 
 @app.post("/api/admin/users")
@@ -247,6 +271,7 @@ def admin_create_user(data: ManagedUserInput, db: Session = Depends(db_session),
     if data.role not in ("teacher", "student"): raise HTTPException(400, "Choose trainer or student")
     if not data.password: raise HTTPException(400, "A password is required for a new account")
     if db.scalar(select(User).where(User.email == email)): raise HTTPException(409, "An account with that email already exists")
+    if any(not db.get(Classroom, cid) for cid in set(data.batch_ids)): raise HTTPException(400, "One or more classrooms do not exist")
     person = User(name=data.name.strip(), email=email, password_hash=pwd.hash(data.password), role=data.role)
     db.add(person); db.flush()
     if data.role == "student":
@@ -264,11 +289,13 @@ def admin_update_user(user_id: int, data: ManagedUserInput, db: Session = Depend
     email = data.email.lower()
     duplicate = db.scalar(select(User).where(User.email == email, User.id != person.id))
     if duplicate: raise HTTPException(409, "An account with that email already exists")
+    if data.role == "student" and any(not db.get(Classroom, cid) for cid in set(data.batch_ids)): raise HTTPException(400, "One or more classrooms do not exist")
     person.name = data.name.strip(); person.email = email
     if data.password: person.password_hash = pwd.hash(data.password)
     if person.role != data.role:
         if person.role == "teacher":
-            for c in db.scalars(select(Classroom).where(Classroom.owner_id == person.id)).all(): c.owner_id = user.id
+            # Keep classrooms intact when a trainer changes role.
+            for c in db.scalars(select(Classroom).where(Classroom.owner_id == person.id)).all(): c.owner_id = None
         else:
             db.query(Enrollment).filter(Enrollment.student_id == person.id).delete(synchronize_session=False)
         person.role = data.role
@@ -288,10 +315,7 @@ def admin_delete_user(user_id: int, db: Session = Depends(db_session), user: Use
     if not person or person.role not in ("teacher", "student"): raise HTTPException(404, "Account not found")
     if person.role == "teacher":
         for c in db.scalars(select(Classroom).where(Classroom.owner_id == person.id)).all():
-            for doc in c.documents:
-                path = UPLOAD_DIR / doc.stored_name
-                if path.is_file(): path.unlink()
-            db.delete(c)
+            c.owner_id = None
     else:
         db.query(Enrollment).filter(Enrollment.student_id == person.id).delete(synchronize_session=False)
     db.delete(person); db.commit(); return {"ok": True}
@@ -301,17 +325,66 @@ def admin_delete_user(user_id: int, db: Session = Depends(db_session), user: Use
 def admin_assign_trainer(batch_id: int, trainer_id: int, db: Session = Depends(db_session), user: User = Depends(admin)):
     c = db.get(Classroom, batch_id); trainer_user = db.get(User, trainer_id)
     if not c: raise HTTPException(404, "Batch not found")
-    if not trainer_user or trainer_user.role != "teacher": raise HTTPException(400, "Choose a trainer account")
-    c.owner_id = trainer_user.id; db.commit(); return {"ok": True}
+    if trainer_id == 0: c.owner_id = None
+    elif not trainer_user or trainer_user.role != "teacher": raise HTTPException(400, "Choose a trainer account")
+    else: c.owner_id = trainer_user.id
+    db.commit(); return {"ok": True}
 
 
 @app.get("/api/auth/me")
 def me(user: User = Depends(current_user)): return pack_user(user)
 
 
+@app.post("/api/admin/classrooms")
+def admin_create_classroom(data: ManagedClassroomInput, db: Session = Depends(db_session), user: User = Depends(admin)):
+    class_id = (data.class_id or "").strip().upper() or f"{re.sub(r'[^A-Z0-9]', '', data.subject.upper())[:4] or 'ROOM'}-{secrets.token_hex(2).upper()}"
+    if db.scalar(select(Classroom).where(Classroom.class_id == class_id)): raise HTTPException(409, "That Class ID is already in use")
+    if data.trainer_id is not None:
+        trainer_user = db.get(User, data.trainer_id)
+        if not trainer_user or trainer_user.role != "teacher": raise HTTPException(400, "Choose a trainer account")
+    c = Classroom(class_id=class_id, name=data.name.strip(), subject=data.subject.strip(), description=data.description.strip(), owner_id=data.trainer_id)
+    db.add(c); db.commit(); db.refresh(c); return {**pack_class(c, db), "trainer_id": c.owner_id}
+
+
+@app.post("/api/admin/classrooms/{classroom_id}/trainer")
+def admin_set_classroom_trainer(classroom_id: int, data: dict[str, int | None], db: Session = Depends(db_session), user: User = Depends(admin)):
+    c = db.get(Classroom, classroom_id)
+    if not c: raise HTTPException(404, "Classroom not found")
+    trainer_id = data.get("trainer_id")
+    if trainer_id is not None:
+        trainer_user = db.get(User, trainer_id)
+        if not trainer_user or trainer_user.role != "teacher": raise HTTPException(400, "Choose a trainer account")
+    c.owner_id = trainer_id; db.commit(); return {"ok": True}
+
+
+@app.put("/api/admin/classrooms/{classroom_id}")
+def admin_update_classroom(classroom_id: int, data: ManagedClassroomInput, db: Session = Depends(db_session), user: User = Depends(admin)):
+    c = db.get(Classroom, classroom_id)
+    if not c: raise HTTPException(404, "Classroom not found")
+    class_id = (data.class_id or c.class_id).strip().upper()
+    duplicate = db.scalar(select(Classroom).where(Classroom.class_id == class_id, Classroom.id != c.id))
+    if duplicate: raise HTTPException(409, "That Class ID is already in use")
+    if data.trainer_id is not None:
+        trainer_user = db.get(User, data.trainer_id)
+        if not trainer_user or trainer_user.role != "teacher": raise HTTPException(400, "Choose a trainer account")
+    c.class_id = class_id; c.name = data.name.strip(); c.subject = data.subject.strip(); c.description = data.description.strip(); c.owner_id = data.trainer_id
+    db.commit(); return {**pack_class(c, db), "trainer_id": c.owner_id}
+
+
+@app.delete("/api/admin/classrooms/{classroom_id}")
+def admin_delete_classroom(classroom_id: int, db: Session = Depends(db_session), user: User = Depends(admin)):
+    c = db.get(Classroom, classroom_id)
+    if not c: raise HTTPException(404, "Classroom not found")
+    for doc in c.documents:
+        path = UPLOAD_DIR / doc.stored_name
+        if path.is_file(): path.unlink()
+    db.delete(c); db.commit(); return {"ok": True}
+
+
 @app.get("/api/classrooms")
 def classrooms(db: Session = Depends(db_session), user: User = Depends(current_user)):
-    if user.role == "teacher": rows = db.scalars(select(Classroom).where(Classroom.owner_id == user.id).order_by(Classroom.created_at.desc())).all()
+    if user.role == "admin": rows = db.scalars(select(Classroom).order_by(Classroom.created_at.desc())).all()
+    elif user.role == "teacher": rows = db.scalars(select(Classroom).where(Classroom.owner_id == user.id).order_by(Classroom.created_at.desc())).all()
     else: rows = db.scalars(select(Classroom).join(Enrollment).where(Enrollment.student_id == user.id)).all()
     return [pack_class(c, db) for c in rows]
 
@@ -342,14 +415,15 @@ def get_class(cid: int, db: Session = Depends(db_session), user: User = Depends(
 @app.get("/api/classrooms/{cid}/students")
 def students(cid: int, db: Session = Depends(db_session), user: User = Depends(current_user)):
     c = owned_class(db, cid, user)
-    if user.role != "teacher": raise HTTPException(403, "Teacher access required")
+    if user.role not in ("teacher", "admin"): raise HTTPException(403, "Teacher access required")
     return [{**pack_user(e.student), "status": e.status, "enrolled_at": e.enrolled_at.isoformat()} for e in c.enrollments]
 
 
 @app.post("/api/classrooms/{cid}/students")
-def add_student(cid: int, data: Credentials, db: Session = Depends(db_session), user: User = Depends(teacher)):
+def add_student(cid: int, data: Credentials, db: Session = Depends(db_session), user: User = Depends(current_user)):
     c = db.get(Classroom, cid)
-    if not c or c.owner_id != user.id: raise HTTPException(404, "Classroom not found")
+    if not c: raise HTTPException(404, "Classroom not found")
+    if user.role != "admin" and (user.role != "teacher" or c.owner_id != user.id): raise HTTPException(403, "Only the assigned trainer or an admin can add students")
     student = db.scalar(select(User).where(User.email == data.email.lower()))
     if not student:
         student = User(name=(data.name or data.email.split("@")[0]).strip(), email=data.email.lower(), password_hash=pwd.hash(data.password), role="student")
@@ -367,9 +441,10 @@ def boards(cid: int, db: Session = Depends(db_session), user: User = Depends(cur
 
 
 @app.post("/api/classrooms/{cid}/boards")
-def save_board(cid: int, data: BoardInput, db: Session = Depends(db_session), user: User = Depends(teacher)):
+def save_board(cid: int, data: BoardInput, db: Session = Depends(db_session), user: User = Depends(current_user)):
     c = db.get(Classroom, cid)
-    if not c or c.owner_id != user.id: raise HTTPException(404, "Classroom not found")
+    if not c: raise HTTPException(404, "Classroom not found")
+    if user.role != "admin" and (user.role != "teacher" or c.owner_id != user.id): raise HTTPException(403, "Only the assigned trainer or an admin can save boards")
     b = Board(classroom_id=cid, name=data.name, snapshot=__import__("json").dumps(data.snapshot))
     db.add(b); db.commit(); db.refresh(b)
     return {"id": b.id, "name": b.name, "saved_at": b.saved_at.isoformat()}
@@ -391,9 +466,10 @@ def documents(cid: int, db: Session = Depends(db_session), user: User = Depends(
 
 
 @app.post("/api/classrooms/{cid}/documents")
-async def upload_document(cid: int, file: UploadFile = File(...), db: Session = Depends(db_session), user: User = Depends(teacher)):
+async def upload_document(cid: int, file: UploadFile = File(...), db: Session = Depends(db_session), user: User = Depends(current_user)):
     c = db.get(Classroom, cid)
-    if not c or c.owner_id != user.id: raise HTTPException(404, "Classroom not found")
+    if not c: raise HTTPException(404, "Classroom not found")
+    if user.role != "admin" and (user.role != "teacher" or c.owner_id != user.id): raise HTTPException(403, "Only the assigned trainer or an admin can upload materials")
     name = Path(file.filename or "document").name
     ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
     if ext not in ALLOWED: raise HTTPException(415, f"File type .{ext} is not allowed")
@@ -418,9 +494,10 @@ def download_document(cid: int, did: int, db: Session = Depends(db_session), use
 
 
 @app.delete("/api/classrooms/{cid}/documents/{did}")
-def delete_document(cid: int, did: int, db: Session = Depends(db_session), user: User = Depends(teacher)):
+def delete_document(cid: int, did: int, db: Session = Depends(db_session), user: User = Depends(current_user)):
     c = db.get(Classroom, cid)
-    if not c or c.owner_id != user.id: raise HTTPException(404, "Classroom not found")
+    if not c: raise HTTPException(404, "Classroom not found")
+    if user.role != "admin" and (user.role != "teacher" or c.owner_id != user.id): raise HTTPException(403, "Only the assigned trainer or an admin can remove materials")
     doc = db.scalar(select(Document).where(Document.id == did, Document.classroom_id == cid))
     if not doc: raise HTTPException(404, "Document not found")
     path = UPLOAD_DIR / doc.stored_name
